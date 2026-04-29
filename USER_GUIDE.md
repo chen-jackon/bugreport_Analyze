@@ -130,26 +130,335 @@
 
 ## 8. 自定义规则（📜 Rules）
 
-`bra` 自带一套规则覆盖 audio / battery / camera / kernel 等常见模块。要扩展或覆盖：
+> 这是最强大的功能——通过 YAML 规则告诉分析器「什么算问题」、「这个模块管哪些日志」。
+> UI 里有表单可以编辑，但理解 YAML 结构能帮你写更精确的规则。
 
-1. 头部点 📜 Rules 打开编辑器
-2. 看左侧列表：「Built-in」是只读的内置规则，「Override」是你的覆盖
-3. 点任意一条 → 在右侧表单里改 → 点 Save
-4. 改过的会保存到：
-   - macOS: `~/Library/Application Support/bugreport-analyzer-app/rules/`
-   - Windows: `%APPDATA%\bugreport-analyzer-app\rules\`
-   - Linux: `~/.config/bugreport-analyzer-app/rules/`
+### 8.1 规则的作用
 
-> **不需要写 YAML**——表单里能直接配 pattern / severity / source 等字段。
+每次分析 bugreport 时，`bra` 会：
 
-### 两种规则类型（自动识别）
+1. 读所有内置规则 + 你的用户规则
+2. 按 **module pack** 分组：每个模块抓哪些 dumpsys 段、关心哪些进程/HAL/property/log tag
+3. 用每条 **known_issue** 的正则去扫该模块对应的日志，命中就生成一条 finding
+4. 用 **common rules** 跨模块扫常见的崩溃/ANR/watchdog 等
 
-- **Module pack**：定义一个模块（dumpsys 段、processes、log_tags、known_issues 等）
-- **Common rules**：跨模块的通用规则列表，每条带 `pattern + severity + source`（如 `SYSTEM LOG`/`KERNEL LOG`/`TOMBSTONE`）
+最终在 UI 上看到的「Issues / Findings」就是这些规则的命中结果。
 
-改完规则会弹一个 toast：「Rules changed. Re-run analysis?」点 Re-analyze 就用新规则重跑当前 bugreport。
+### 8.2 在 UI 里编辑
 
-「↺ Revert to built-in」会删除你的覆盖，恢复内置版本。
+1. 头部点 **📜 Rules** 打开管理器
+2. 左侧列表：
+   - **Built-in**（带 🔒 图标）：内置规则，只读
+   - **Override**：你的覆盖（同名文件会覆盖内置）
+   - **Custom**：你新建的，不与任何内置同名
+3. 点条目 → 右侧表单 → 改 → **Save**
+4. 改完弹出 toast「Rules changed. Re-analyze?」→ 点了就用新规则重跑当前 bugreport
+5. **↺ Revert to built-in** 删除覆盖，恢复内置版本
+
+用户规则保存路径：
+
+| 系统 | 路径 |
+|---|---|
+| macOS | `~/Library/Application Support/bugreport-analyzer-app/rules/` |
+| Windows | `%APPDATA%\bugreport-analyzer-app\rules\` |
+| Linux | `~/.config/bugreport-analyzer-app/rules/` |
+
+> 你也可以直接把 `.yaml` 文件丢到这个目录，重启 app 就会加载。
+
+### 8.3 两种 schema（管理器自动识别）
+
+打开任何 YAML 文件时，UI 看顶层结构来选表单：
+- 顶层是 **对象 + 有 `module:` key** → **Module pack**
+- 顶层是 **数组** → **Common rules**
+
+不要在同一个文件里混写两种。
+
+---
+
+### 8.4 Module pack（模块知识包）
+
+定义一个模块的「专家知识」——它管哪些日志、哪些进程、什么算问题。
+
+完整示例（`audio.yaml`）：
+
+```yaml
+module: audio                    # 内部 ID（必须，全局唯一；同名会被合并）
+display_name: 音频               # UI 上显示的中/英文名
+
+# 该模块需要从 bugreport 抓哪些 dumpsys 段
+dumpsys_sections:
+  - DUMPSYS::media.audio_flinger
+  - DUMPSYS::media.audio_policy
+  - DUMPSYS::audio
+  - DUMPSYS::media.metrics
+
+# 该模块涉及的进程名（exact match）
+processes:
+  - audioserver
+  - android.hardware.audio.service
+
+# package name（Android app 包名，目前只用作展示）
+packages: []
+
+# 该模块关心的 logcat tag（精确匹配 TAG 字段）
+log_tags:
+  - AudioFlinger
+  - AudioPolicy
+  - AudioTrack
+
+# 该模块相关的 system property 名（支持 fnmatch 通配符 *）
+properties:
+  - 'persist.vendor.audio.*'
+  - 'audio.*'
+  - 'ro.audio.*'
+
+# 抽取的额外文件（路径相对 bugreport 根目录，glob）
+files: []
+
+# 涉及的 HAL 接口前缀（lshal 解析时用）
+hal_interfaces:
+  - android.hardware.audio
+  - android.hardware.audio.effect
+
+# 已知问题：扫该模块对应日志，命中就生成 finding
+known_issues:
+  - id: audio_hal_died               # 唯一 ID
+    pattern: 'audio.*HAL.*died|audioserver.*FATAL'  # Python 正则（re.search）
+    severity: CRITICAL               # CRITICAL / HIGH / MEDIUM / INFO
+    summary: 'AudioHAL/audioserver 异常'   # 出现在 findings 列表里的标题
+    context_lines: 40                # finding 详情里附带前后多少行上下文
+
+  - id: audio_track_underrun
+    pattern: 'underrun=[1-9][0-9]*|AudioTrack.*starv'
+    severity: MEDIUM
+    summary: 'AudioTrack underrun/欠载'
+    context_lines: 20
+```
+
+**字段说明：**
+
+| 字段 | 必填 | 类型 | 作用 |
+|---|---|---|---|
+| `module` | ✅ | string | 模块 ID，全局唯一；同名 YAML 会合并（用户文件追加内置数组项） |
+| `display_name` | ❌ | string | UI 上显示用，省略则用 `module` |
+| `dumpsys_sections` | ❌ | string[] | bugreport 里要抓的 dumpsys 段名，前缀 `DUMPSYS::` |
+| `processes` | ❌ | string[] | 进程名（精确匹配） |
+| `packages` | ❌ | string[] | Android 包名 |
+| `properties` | ❌ | string[] | system property 名，支持 `*` 通配（fnmatch） |
+| `log_tags` | ❌ | string[] | logcat tag |
+| `files` | ❌ | string[] | 额外要抽取的文件路径 |
+| `hal_interfaces` | ❌ | string[] | HAL 接口前缀，匹配 `lshal` 输出 |
+| `known_issues` | ❌ | KnownIssue[] | 该模块的检测规则 |
+
+**KnownIssue 字段：**
+
+| 字段 | 必填 | 默认值 | 作用 |
+|---|---|---|---|
+| `id` | ✅ | — | 规则唯一 ID |
+| `pattern` | ✅ | — | Python 正则，`re.search` 语义 |
+| `severity` | ❌ | `MEDIUM` | `CRITICAL` / `HIGH` / `MEDIUM` / `INFO` |
+| `summary` | ❌ | `""` | UI 上显示的标题 |
+| `context_lines` | ❌ | `30` | finding 详情附带的前后行数 |
+
+**合并行为**：如果用户文件和内置文件都有 `module: audio`，**两者会合并**——所有数组字段（dumpsys_sections / processes / known_issues 等）都是追加。所以你只想加一条规则不必抄整份内置文件。例如 `~/.config/.../rules/audio.yaml`：
+
+```yaml
+module: audio
+known_issues:
+  - id: my_custom_audio_glitch
+    pattern: 'AudioPCM.*glitch.*count=([5-9]|[1-9][0-9]+)'
+    severity: HIGH
+    summary: '音频 PCM 抖动严重'
+    context_lines: 25
+```
+
+只这几行，就在内置 audio 模块上加了一条规则。
+
+---
+
+### 8.5 Common rules（跨模块通用规则）
+
+不属于具体模块的规则，比如「任何 SYSTEM LOG 里出现 FATAL EXCEPTION 就报警」。
+顶层是数组，每条是一个 `CommonRule`。
+
+完整示例：
+
+```yaml
+- id: fatal_exception            # 唯一 ID
+  name: Java FATAL EXCEPTION     # 内部名（可选，目前没用到）
+  severity: CRITICAL
+  module: crash                  # 归到哪个模块（findings 列表里的分组）
+  source: SYSTEM LOG             # 在哪个 section 里搜（见下方表格）
+  pattern: 'FATAL EXCEPTION'
+  context_lines: 40
+  summary: 'Java 崩溃 (FATAL EXCEPTION)'
+
+- id: anr_in
+  name: ANR
+  severity: HIGH
+  module: crash
+  source: SYSTEM LOG
+  pattern: 'ANR in '
+  context_lines: 40
+  summary: 'ANR 应用无响应'
+
+- id: kernel_panic
+  severity: CRITICAL
+  module: kernel
+  source: KERNEL LOG
+  pattern: 'Kernel panic|Unable to handle kernel'
+  context_lines: 40
+  summary: '内核 panic'
+```
+
+**字段说明：**
+
+| 字段 | 必填 | 默认值 | 作用 |
+|---|---|---|---|
+| `id` | ✅ | — | 规则唯一 ID |
+| `name` | ✅ | — | 规则名 |
+| `severity` | ✅ | — | `CRITICAL` / `HIGH` / `MEDIUM` / `INFO` |
+| `module` | ✅ | — | 归类到哪个模块（用于 findings 分组） |
+| `source` | ✅ | — | 要扫的 section 名（见下方常用值） |
+| `pattern` | ✅ | — | Python 正则 |
+| `summary` | ❌ | `""` | UI 显示标题 |
+| `context_lines` | ❌ | `30` | 上下文行数 |
+
+**`source` 常用值：**
+
+| `source` | 对应内容 |
+|---|---|
+| `SYSTEM LOG` | logcat -b system 全量日志 |
+| `MAIN LOG` | logcat -b main |
+| `KERNEL LOG` | dmesg / kernel 日志 |
+| `EVENT LOG` | logcat -b events |
+| `RADIO LOG` | logcat -b radio |
+| `TOMBSTONE` | tombstone 文件内容 |
+| `DUMPSYS` | dumpsys 全量输出 |
+
+> `source` 是 bugreport 内 section 头部的字符串。如果你不确定，找一份 bugreport 的 raw `.txt`，看顶部的 `------ XXX ------` 横线分割块的标题。
+
+---
+
+### 8.6 正则写作要点
+
+`pattern` 用 Python `re.search`（不是完全匹配；只要行内有一处匹配就算）。
+
+**常见技巧：**
+
+| 想匹配 | 写法 |
+|---|---|
+| 多个关键字任一 | `'FATAL\|crash\|panic'` |
+| 大小写不敏感 | 写正则前缀 `(?i)`，例如 `'(?i)error'` |
+| 数值大于 N | `'underrun=[1-9][0-9]*'`（≥10）；用字符类不要用 `+` 量词 |
+| 进程名 + 错误 | `'audioserver.*FATAL'` |
+| 整词 | 用 `\b`，例如 `'\bANR\b'` |
+| 转义元字符 | `\.` 匹配 `.`，`\(` 匹配 `(` |
+
+**避免的坑：**
+
+- `.+` 在很长的行上会炸——优先用具体字符类
+- 不要在 YAML 里用裸字符串写包含 `:` 或 `#` 的正则——用单引号包起来
+- pattern 错误时 bra 会跳过该规则并打 warning，但不会让分析失败
+
+**调试规则：**
+
+```bash
+# 只看你新加的规则的命中
+bra ./bugreport.zip --rules ./my-rules/ -o /tmp/test
+cat /tmp/test/data/findings.json | jq '.[] | select(.rule_id=="my_custom_audio_glitch")'
+```
+
+---
+
+### 8.7 实战例子
+
+**例 1：在内置 camera 模块上加一条规则**
+
+文件：`~/Library/Application Support/bugreport-analyzer-app/rules/camera.yaml`
+
+```yaml
+module: camera
+known_issues:
+  - id: camera_hal3_session_failed
+    pattern: 'CameraDeviceSession.*configureStreams.*returned -[0-9]+'
+    severity: HIGH
+    summary: 'Camera HAL3 会话配置失败'
+    context_lines: 30
+```
+
+**例 2：完全自定义一个新模块**
+
+文件：`~/.config/bugreport-analyzer-app/rules/wifi_p2p.yaml`
+
+```yaml
+module: wifi_p2p
+display_name: Wi-Fi 直连
+dumpsys_sections:
+  - DUMPSYS::wifip2p
+processes:
+  - wpa_supplicant
+log_tags:
+  - WifiP2pService
+  - SupplicantP2pIfaceCallback
+properties:
+  - 'persist.wifi.p2p.*'
+known_issues:
+  - id: p2p_group_failed
+    pattern: 'P2P_GROUP_FORMATION_FAILURE|p2p.*group.*creation.*failed'
+    severity: HIGH
+    summary: 'Wi-Fi P2P 组创建失败'
+    context_lines: 25
+```
+
+重启 app 或点 Re-analyze 后，左侧 module tree 会出现「Wi-Fi 直连」节点。
+
+**例 3：跨模块的常见规则**
+
+文件：`~/.config/bugreport-analyzer-app/rules/my_common.yaml`
+
+```yaml
+- id: my_oom_pattern
+  name: OOM in our app
+  severity: CRITICAL
+  module: memory
+  source: SYSTEM LOG
+  pattern: 'OutOfMemoryError.*com\.mycompany\.myapp'
+  context_lines: 60
+  summary: '我们的 app 发生 OOM'
+
+- id: my_native_assert
+  name: Native assert
+  severity: CRITICAL
+  module: crash
+  source: SYSTEM LOG
+  pattern: 'libmycompany\.so.*ASSERT_FAILED'
+  context_lines: 40
+  summary: 'libmycompany.so 触发断言'
+```
+
+---
+
+### 8.8 内置规则一览
+
+`bra` 自带的内置规则覆盖：
+
+| 模块 | 文件 | 主要内容 |
+|---|---|---|
+| audio | `audio.yaml` | AudioFlinger / AudioPolicy / underrun |
+| battery | `battery.yaml` | 电量异常、充电问题 |
+| bluetooth | `bluetooth.yaml` | BT 连接、配对、HFP/A2DP |
+| camera | `camera.yaml` | Camera HAL、流配置失败 |
+| display | `display.yaml` | SurfaceFlinger、合成器 |
+| kernel | `kernel.yaml` | panic、OOM、I/O error |
+| memory | `memory.yaml` | LMK、OOM、内存压力 |
+| network | `network.yaml` | 连接失败、DNS、proxy |
+| sensors | `sensors.yaml` | 传感器 HAL、SensorService |
+| storage | `storage.yaml` | I/O 错误、挂载失败 |
+| usb | `usb.yaml` | USB 模式、AOAP |
+| **common** | `common.yaml` | 跨模块：FATAL EXCEPTION / ANR / kernel panic / WTF / watchdog 等 |
+
+源码：[bugreport-analyzer/bra/rules/builtin/](https://github.com/chen-jackon/bugreport_Analyze)（在 public 仓里我没放，但你能在分析输出的 HTML 报告里看到所有规则）。
 
 ---
 
